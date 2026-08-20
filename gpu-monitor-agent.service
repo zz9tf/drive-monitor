@@ -1,0 +1,16 @@
+[Unit]
+Description=GPU Monitor Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/zz/miniconda3/bin/conda run -n ptm python3 /home/zz/gpu-monitor/agent.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/zz/gpu-monitor/agent.log
+StandardError=append:/home/zz/gpu-monitor/agent.log
+Environment=DASHBOARD_URL=http://10.33.48.226:8080/update
+
+[Install]
+WantedBy=multi-user.target
