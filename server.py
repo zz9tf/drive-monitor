@@ -322,14 +322,7 @@ es.onmessage = async e => {
     document.getElementById('update-rate').textContent = `· updated every ~${secs}s`;
   }
   _lastUpdateTime = now;
-  await loadState();
-  if (activeHost === msg.host) {
-    if (msg.log) {
-      await refreshLogs();
-    } else {
-      refreshContent();
-    }
-  }
+  await loadState();  // updates sidebar only
 };
 es.onopen = () => setStatus('Live ●');
 es.onerror = () => setStatus('Reconnecting...');
