@@ -91,7 +91,7 @@ def _load_logs_from_disk():
             print(f"[WARN] failed to load {path}: {e}")
             continue
         logs[hostname] = entries
-        _prune_logs(hostname)
+        _prune_logs(hostname)  # also rebuilds _seen_log_keys
         print(f"[startup] loaded {len(logs[hostname])} log entries for {hostname}")
 
 
