@@ -37,12 +37,13 @@ event_log = []  # in-memory event log, newest first
 event_lock = threading.Lock()
 
 
-def add_event(level, msg, gpu_id=None, processes=None):
+def add_event(level, msg, gpu_id=None, gpu_uuid=None, processes=None):
     entry = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,   # "error" / "warn" / "info"
         "msg": msg,
         "gpu_id": gpu_id,
+        "gpu_uuid": gpu_uuid,
         "processes": processes or [],
     }
     with event_lock:
@@ -227,8 +228,9 @@ def watch_dmesg():
             print("[WARN] Cannot tail dmesg — XID detection disabled")
             return
 
-    # build PCI bus -> GPU index map for XID attribution
+    # build PCI bus -> (GPU index, UUID) map for XID attribution
     pci_to_idx = {}
+    pci_to_uuid = {}
     try:
         pynvml.nvmlInit()
         for i in range(pynvml.nvmlDeviceGetCount()):
@@ -236,6 +238,7 @@ def watch_dmesg():
             pci = pynvml.nvmlDeviceGetPciInfo(h)
             bus = f"{pci.domain:04x}:{pci.bus:02x}:{pci.device:02x}"
             pci_to_idx[bus] = i
+            pci_to_uuid[bus] = pynvml.nvmlDeviceGetUUID(h)
     except Exception:
         pass
 
@@ -254,6 +257,7 @@ def watch_dmesg():
             xid = xid_match.group(2)
             desc = XID_DESC.get(xid, "unknown error")
             gpu_id = pci_to_idx.get(pci_addr)
+            gpu_uuid = pci_to_uuid.get(pci_addr)
             if gpu_id is None:
                 # fallback: look for "GPU<N>" mention in message
                 gm = gpu_pattern.search(line)
@@ -262,7 +266,8 @@ def watch_dmesg():
             procs = _snapshot_gpu_procs_cached()
             if gpu_id is not None:
                 procs = [p for p in procs if p.get("gpu_id") == gpu_id]
-            add_event(level, f"XID {xid}: {desc} | raw: {line[:120]}", gpu_id=gpu_id, processes=procs)
+            add_event(level, f"XID {xid}: {desc} | PCI:{pci_addr} | raw: {line[:120]}",
+                      gpu_id=gpu_id, gpu_uuid=gpu_uuid, processes=procs)
         elif "error" in line.lower() or "fault" in line.lower():
             add_event("warn", f"NVRM: {line[:150]}")
 

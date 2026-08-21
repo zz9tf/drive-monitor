@@ -63,6 +63,7 @@ async def update(request: Request):
                 "level": ev.get("level", "info").lower(),
                 "msg": str(ev.get("msg", "")),
                 "gpu_id": ev.get("gpu_id"),
+                "gpu_uuid": ev.get("gpu_uuid"),
                 "hostname": hostname,
             }
             if hostname not in logs:
@@ -542,12 +543,13 @@ function renderLogTable(logs) {
     }</p>`;
     return;
   }
-  let html = `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>Message</th></tr>`;
+  let html = `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>UUID</th><th>Message</th></tr>`;
   for (const e of filtered)
     html += `<tr>
       <td style="white-space:nowrap">${e.t.replace('T',' ').slice(0,19)}</td>
       <td class="lv-${e.level}">${e.level.toUpperCase()}</td>
       <td>${e.gpu_id != null ? e.gpu_id : '—'}</td>
+      <td style="font-size:.7em;color:#94a3b8;white-space:nowrap">${e.gpu_uuid ? e.gpu_uuid.slice(-8) : '—'}</td>
       <td class="log-msg">${escHtml(e.msg)}</td>
     </tr>`;
   html += `</table>`;
