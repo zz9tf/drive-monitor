@@ -152,8 +152,8 @@ async def api_logs(hostname: str, limit: int = 500):
     with state_lock:
         _prune_logs(hostname)
         entries = list(logs.get(hostname, []))
-    # return newest-first for the UI
-    entries = entries[-limit:][::-1]
+    entries.sort(key=lambda e: e["t"])
+    entries = entries[-limit:][::-1]  # newest-first
     return entries
 
 
