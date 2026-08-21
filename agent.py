@@ -279,13 +279,53 @@ def push(payload):
         print(f"[WARN] push failed: {e}")
 
 
+CPU_WARN_PCT  = 60   # log warn when CPU stays above this
+CPU_ALERT_PCT = 90   # log error when CPU stays above this
+MEM_WARN_PCT  = 80
+MEM_ALERT_PCT = 95
+
+_cpu_high_since: float | None = None
+_mem_high_since: float | None = None
+
+
+def check_system_resources(cpu_pct: float, mem_pct: float):
+    global _cpu_high_since, _mem_high_since
+    now = time.time()
+
+    # CPU
+    if cpu_pct >= CPU_WARN_PCT:
+        if _cpu_high_since is None:
+            _cpu_high_since = now
+        elif now - _cpu_high_since >= 15:   # sustained 15s before alerting
+            level = "error" if cpu_pct >= CPU_ALERT_PCT else "warn"
+            top = subprocess.check_output(
+                ["ps", "-eo", "pid,user,pcpu,comm", "--sort=-pcpu", "--no-headers"],
+                timeout=3
+            ).decode().splitlines()[:5]
+            top_str = " | ".join(l.strip() for l in top)
+            add_event(level, f"CPU high: {cpu_pct:.1f}% for {int(now-_cpu_high_since)}s | top: {top_str}")
+            _cpu_high_since = now   # reset to avoid repeated alerts every 5s
+    else:
+        _cpu_high_since = None
+
+    # Memory
+    if mem_pct >= MEM_WARN_PCT:
+        if _mem_high_since is None:
+            _mem_high_since = now
+        elif now - _mem_high_since >= 15:
+            level = "error" if mem_pct >= MEM_ALERT_PCT else "warn"
+            add_event(level, f"Memory high: {mem_pct:.1f}% sustained {int(now-_mem_high_since)}s")
+            _mem_high_since = now
+    else:
+        _mem_high_since = None
+
+
 def main():
     print(f"[agent] starting, pushing to {DASHBOARD_URL} every {INTERVAL}s")
     threading.Thread(target=watch_dmesg, daemon=True).start()
 
     while True:
         gpu_procs = get_gpu_processes()
-        # flatten for snapshot
         flat = []
         for gid, ps in gpu_procs.items():
             for p in ps:
@@ -297,11 +337,12 @@ def main():
         gpu_stats = get_gpu_stats(gpu_procs)
         check_gpu_hang()
 
-        with event_lock:
-            recent_events = event_log[:50]
-
         cpu_pct = psutil.cpu_percent(interval=None)
         mem = psutil.virtual_memory()
+        check_system_resources(cpu_pct, mem.percent)
+
+        with event_lock:
+            recent_events = event_log[:50]
 
         payload = {
             "hostname": HOSTNAME,
