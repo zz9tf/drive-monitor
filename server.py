@@ -331,7 +331,13 @@ es.onmessage = async e => {
   }
 };
 es.onopen = () => setStatus('Live ●');
-es.onerror = () => { setStatus('Reconnecting...'); setTimeout(loadState, 3000); };
+es.onerror = () => setStatus('Reconnecting...');
+
+// polling fallback: refresh every 10s regardless of SSE
+setInterval(async () => {
+  await loadState();
+  if (activeHost) refreshContent();
+}, 10000);
 
 function setStatus(s) { document.getElementById('conn-status').textContent = s; }
 

@@ -20,16 +20,17 @@ HOSTNAME = socket.gethostname()
 
 # XID error meanings (most common ones)
 XID_DESC = {
-    "8":  "GPU memory access fault",
-    "31": "GPU memory page fault",
-    "48": "Double-bit ECC error",
-    "61": "Internal micro-controller halt (deadlock)",
-    "62": "Internal micro-controller halt (deadlock)",
-    "63": "ECC page retirement",
-    "74": "NVLINK error",
-    "79": "GPU fallen off the bus (hard hang)",
-    "92": "High single-bit ECC error rate",
+    "8":   "GPU memory access fault",
+    "31":  "GPU memory page fault",
+    "48":  "Double-bit ECC error",
+    "61":  "Internal micro-controller halt (deadlock)",
+    "62":  "Internal micro-controller halt (deadlock)",
+    "63":  "ECC page retirement",
+    "74":  "NVLink fatal error",
+    "79":  "GPU fallen off the bus (hard hang)",
+    "92":  "High single-bit ECC error rate",
     "119": "GSP RPC timeout (firmware unresponsive)",
+    "154": "GPU recovery required (node reboot needed)",
 }
 
 event_log = []  # in-memory event log, newest first
@@ -257,7 +258,7 @@ def watch_dmesg():
                 # fallback: look for "GPU<N>" mention in message
                 gm = gpu_pattern.search(line)
                 gpu_id = int(gm.group(1)) if gm else None
-            level = "error" if xid in ("61", "62", "79", "48", "119") else "warn"
+            level = "error" if xid in ("61", "62", "79", "48", "119", "154") else "warn"
             procs = _snapshot_gpu_procs_cached()
             if gpu_id is not None:
                 procs = [p for p in procs if p.get("gpu_id") == gpu_id]
