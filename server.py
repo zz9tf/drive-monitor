@@ -3,8 +3,11 @@
 
 import asyncio
 import json
+import os
+import pathlib
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
@@ -19,12 +22,77 @@ MAX_HISTORY = 17280          # 24h at 5s intervals
 LOG_MAX_AGE = timedelta(days=7)
 LOG_MAX_PER_HOST = 20000     # hard cap per host
 
+LOG_DIR = pathlib.Path(os.path.dirname(os.path.abspath(__file__)))
+
 state: dict[str, Any] = {}
 history: dict[str, deque] = {}   # hostname -> deque of slim datapoints
 logs: dict[str, list] = {}       # hostname -> list of log entries (newest last)
+_seen_log_keys: dict[str, set] = {}  # hostname -> set of (t, msg) for O(1) dedup
 state_lock = threading.Lock()
 subscribers: list[asyncio.Queue] = []
 subs_lock = threading.Lock()
+
+
+# ── Disk persistence ──────────────────────────────────────────────────────────
+
+def _log_path(hostname: str) -> pathlib.Path:
+    safe = hostname.replace("/", "_").replace("\\", "_").replace(":", "_")
+    return LOG_DIR / f"gpu_monitor_logs_{safe}.jsonl"
+
+
+def _append_log_to_disk(hostname: str, entry: dict):
+    try:
+        with open(_log_path(hostname), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[WARN] log write failed for {hostname}: {e}")
+
+
+def _compact_logs_to_disk():
+    """Rewrite each log file with only the current in-memory (already pruned) entries."""
+    with state_lock:
+        snapshot = {h: list(v) for h, v in logs.items()}
+    for hostname, entries in snapshot.items():
+        try:
+            path = _log_path(hostname)
+            tmp = path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e) + "\n")
+            tmp.replace(path)
+        except Exception as e:
+            print(f"[WARN] compact failed for {hostname}: {e}")
+
+
+def _compact_loop():
+    """Background thread: compact log files every 30 minutes."""
+    while True:
+        time.sleep(1800)
+        _compact_logs_to_disk()
+        print(f"[compact] log files rewritten at {datetime.now().strftime('%H:%M:%S')}")
+
+
+def _load_logs_from_disk():
+    """On startup: read all *.jsonl files and populate in-memory logs."""
+    for path in LOG_DIR.glob("gpu_monitor_logs_*.jsonl"):
+        hostname = path.stem[len("gpu_monitor_logs_"):]
+        entries = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            print(f"[WARN] failed to load {path}: {e}")
+            continue
+        logs[hostname] = entries
+        _prune_logs(hostname)
+        print(f"[startup] loaded {len(logs[hostname])} log entries for {hostname}")
 
 
 def broadcast(msg: str):
@@ -47,6 +115,7 @@ def _prune_logs(hostname: str):
     if len(entries) > LOG_MAX_PER_HOST:
         entries = entries[-LOG_MAX_PER_HOST:]
     logs[hostname] = entries
+    _seen_log_keys[hostname] = {(e["t"], e["msg"]) for e in entries}
 
 
 @app.post("/update")
@@ -68,10 +137,12 @@ async def update(request: Request):
             }
             if hostname not in logs:
                 logs[hostname] = []
-            # avoid duplicates: skip if same t+msg already stored
-            if not any(e["t"] == entry["t"] and e["msg"] == entry["msg"]
-                       for e in logs[hostname][-20:]):
+            key = (entry["t"], entry["msg"])
+            seen = _seen_log_keys.setdefault(hostname, set())
+            if key not in seen:
+                seen.add(key)
                 logs[hostname].append(entry)
+                _append_log_to_disk(hostname, entry)
         if hostname in logs:
             _prune_logs(hostname)
         if hostname not in history:
@@ -115,8 +186,13 @@ async def receive_log(request: Request):
     with state_lock:
         if hostname not in logs:
             logs[hostname] = []
-        logs[hostname].append(entry)
-        _prune_logs(hostname)
+        key = (entry["t"], entry["msg"])
+        seen = _seen_log_keys.setdefault(hostname, set())
+        if key not in seen:
+            seen.add(key)
+            logs[hostname].append(entry)
+            _prune_logs(hostname)
+            _append_log_to_disk(hostname, entry)
     broadcast(json.dumps({"host": hostname, "log": True}))
     return {"ok": True}
 
@@ -148,13 +224,24 @@ async def api_history(hostname: str, points: int = 500):
 
 
 @app.get("/api/logs/{hostname}")
-async def api_logs(hostname: str, limit: int = 500):
+async def api_logs(hostname: str, page: int = 1, per_page: int = 50, level: str = ""):
     with state_lock:
         _prune_logs(hostname)
         entries = list(logs.get(hostname, []))
-    entries.sort(key=lambda e: e["t"])
-    entries = entries[-limit:][::-1]  # newest-first
-    return entries
+    entries.sort(key=lambda e: e["t"], reverse=True)  # newest-first
+    if level and level != "all":
+        entries = [e for e in entries if e.get("level") == level]
+    total = len(entries)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    return {
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
+        "entries": entries[start:start + per_page],
+    }
 
 
 
@@ -272,7 +359,13 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f0f2f5;color:#1f
 .log-filter{margin-left:auto;display:flex;gap:4px}
 .log-filter button{font-size:.72em;padding:2px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;color:#6b7280;cursor:pointer}
 .log-filter button.active{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;font-weight:600}
-.log-table-wrap{max-height:320px;overflow-y:auto}
+.log-table-wrap{overflow-x:auto}
+.log-pagination{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:.78em;color:#6b7280}
+.log-pagination button{padding:3px 10px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;color:#374151;cursor:pointer;font-size:.85em}
+.log-pagination button:hover:not(:disabled){background:#f3f4f6}
+.log-pagination button:disabled{opacity:.4;cursor:default}
+.log-pagination .pg-info{color:#9ca3af}
+.per-page-select{padding:2px 6px;border:1px solid #e5e7eb;border-radius:6px;font-size:.85em;color:#374151;background:#fff;cursor:pointer}
 table{width:100%;border-collapse:collapse;font-size:.78em}
 th{color:#9ca3af;font-weight:600;padding:5px 8px;text-align:left;border-bottom:1px solid #f3f4f6;position:sticky;top:0;background:#fff;z-index:1}
 td{padding:5px 8px;border-bottom:1px solid #f9fafb;color:#374151;vertical-align:top}
@@ -310,7 +403,10 @@ let gpuLineChart = null;
 let _lastUpdateTime = null;
 let _lastHist = null;
 let _logFilter = 'all';   // 'all' | 'info' | 'warn' | 'error'
-let _currentLogs = [];
+let _logPage = 1;
+let _logPerPage = 50;
+let _logTotal = 0;
+let _logPages = 1;
 
 // ── SSE ──────────────────────────────────────────────
 const es = new EventSource('/events');
@@ -341,8 +437,13 @@ async function loadHistory(host) {
   return r.json();
 }
 
-async function fetchLogs(host) {
-  const r = await fetch(`/api/logs/${encodeURIComponent(host)}?limit=500`);
+async function fetchLogs(host, page, perPage, level) {
+  page = page || _logPage;
+  perPage = perPage || _logPerPage;
+  level = level !== undefined ? level : _logFilter;
+  let url = `/api/logs/${encodeURIComponent(host)}?page=${page}&per_page=${perPage}`;
+  if (level && level !== 'all') url += `&level=${level}`;
+  const r = await fetch(url);
   return r.json();
 }
 
@@ -373,17 +474,18 @@ function renderSidebar() {
 
 async function selectHost(host) {
   activeHost = host;
+  _logPage = 1;
   history.replaceState(null, '', `?host=${encodeURIComponent(host)}`);
   document.getElementById('active-title').textContent = host;
   renderSidebar();
   cpuMemChart = null; gpuLineChart = null;
   document.getElementById('no-host') && (document.getElementById('no-host').style.display = 'none');
   refreshContent();
-  const [hist, logs] = await Promise.all([loadHistory(host), fetchLogs(host)]);
+  const [hist, logData] = await Promise.all([loadHistory(host), fetchLogs(host)]);
   _lastHist = hist;
-  _currentLogs = logs;
+  _applyLogData(logData);
   renderCharts(hist);
-  renderLogTable(_currentLogs);
+  renderLogTable();
 }
 
 // ── Main content ──────────────────────────────────────
@@ -497,21 +599,38 @@ function refreshContent() {
   document.getElementById('content').innerHTML = html;
 
   if (_lastHist) renderCharts(_lastHist);
-  if (_currentLogs.length) renderLogTable(_currentLogs);
   attachFilterButtons();
 }
 
+function _applyLogData(data) {
+  _logTotal = data.total || 0;
+  _logPage = data.page || 1;
+  _logPerPage = data.per_page || 50;
+  _logPages = data.pages || 1;
+}
+
 async function refreshLogs() {
-  _currentLogs = await fetchLogs(activeHost);
-  renderLogTable(_currentLogs);
+  const data = await fetchLogs(activeHost);
+  _applyLogData(data);
+  renderLogTable();
+}
+
+async function goLogPage(p) {
+  _logPage = p;
+  const data = await fetchLogs(activeHost, _logPage, _logPerPage);
+  _applyLogData(data);
+  renderLogTable(data.entries);
+}
+
+async function changePerPage(pp) {
+  _logPerPage = parseInt(pp);
+  _logPage = 1;
+  const data = await fetchLogs(activeHost, _logPage, _logPerPage);
+  _applyLogData(data);
+  renderLogTable(data.entries);
 }
 
 // ── Log rendering ─────────────────────────────────────
-function filterLogs(logs) {
-  if (_logFilter === 'all') return logs;
-  return logs.filter(e => e.level === _logFilter);
-}
-
 function logFilterButtons() {
   return ['all','info','warn','error'].map(f =>
     `<button class="log-filter-btn${_logFilter===f?' active':''}" data-f="${f}">${f}</button>`
@@ -520,40 +639,74 @@ function logFilterButtons() {
 
 function attachFilterButtons() {
   document.querySelectorAll('.log-filter-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       _logFilter = btn.dataset.f;
-      renderLogTable(_currentLogs);
+      _logPage = 1;
+      const data = await fetchLogs(activeHost, 1, _logPerPage, _logFilter);
+      _applyLogData(data);
+      renderLogTable(data.entries);
     });
   });
+  const sel = document.getElementById('per-page-select');
+  if (sel) sel.addEventListener('change', () => changePerPage(sel.value));
 }
 
-function renderLogTable(logs) {
+function renderLogTable(entries) {
   const wrap = document.getElementById('log-table-wrap');
   const countEl = document.getElementById('log-count');
   if (!wrap) return;
-  const filtered = filterLogs(logs);
-  if (countEl) countEl.textContent = `${logs.length} entries (7 days)`;
-  // update filter buttons active state
+
+  // update filter buttons
   document.querySelectorAll('.log-filter-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.f === _logFilter);
   });
-  if (!filtered.length) {
+
+  const label = _logFilter === 'all' ? '' : ` (${_logFilter})`;
+  if (countEl) countEl.textContent = `${_logTotal} entries${label} · 7 days`;
+
+  if (!entries || !entries.length) {
     wrap.innerHTML = `<p style="font-size:.82em;color:#9ca3af;padding:8px 0">${
-      logs.length ? 'No entries match the filter.' : 'No logs yet. POST to <code>/log</code> from any device.'
+      _logTotal ? 'No entries match the filter.' : 'No logs yet.'
     }</p>`;
+    renderPagination();
     return;
   }
-  let html = `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>UUID</th><th>Message</th></tr>`;
-  for (const e of filtered)
+
+  let html = `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>Message</th></tr>`;
+  for (const e of entries)
     html += `<tr>
       <td style="white-space:nowrap">${e.t.replace('T',' ').slice(0,19)}</td>
       <td class="lv-${e.level}">${e.level.toUpperCase()}</td>
       <td>${e.gpu_id != null ? e.gpu_id : '—'}</td>
-      <td style="font-size:.7em;color:#94a3b8;white-space:nowrap">${e.gpu_uuid ? e.gpu_uuid.slice(-8) : '—'}</td>
       <td class="log-msg">${escHtml(e.msg)}</td>
     </tr>`;
   html += `</table>`;
   wrap.innerHTML = html;
+  renderPagination();
+}
+
+function renderPagination() {
+  let pg = document.getElementById('log-pagination');
+  if (!pg) {
+    pg = document.createElement('div');
+    pg.id = 'log-pagination';
+    pg.className = 'log-pagination';
+    const panel = document.getElementById('log-panel');
+    if (panel) panel.appendChild(pg);
+  }
+  const perPageOpts = [25, 50, 100, 200].map(n =>
+    `<option value="${n}"${n===_logPerPage?' selected':''}>${n}/page</option>`
+  ).join('');
+  pg.innerHTML = `
+    <button onclick="goLogPage(1)" ${_logPage<=1?'disabled':''}>«</button>
+    <button onclick="goLogPage(${_logPage-1})" ${_logPage<=1?'disabled':''}>‹</button>
+    <span class="pg-info">Page ${_logPage} / ${_logPages}</span>
+    <button onclick="goLogPage(${_logPage+1})" ${_logPage>=_logPages?'disabled':''}>›</button>
+    <button onclick="goLogPage(${_logPages})" ${_logPage>=_logPages?'disabled':''}>»</button>
+    <select id="per-page-select" class="per-page-select">${perPageOpts}</select>
+  `;
+  const sel = pg.querySelector('#per-page-select');
+  if (sel) sel.addEventListener('change', () => changePerPage(sel.value));
 }
 
 function escHtml(s) {
@@ -637,5 +790,7 @@ async def dashboard():
 
 
 if __name__ == "__main__":
+    _load_logs_from_disk()
+    threading.Thread(target=_compact_loop, daemon=True).start()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")

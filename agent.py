@@ -179,6 +179,7 @@ def check_gpu_hang():
 
 _last_gpu_procs = []
 _known_pids: set[int] = set()  # track seen PIDs to detect start/stop
+_pid_info: dict[int, dict] = {}  # cache process info so finish msg can show user/cmd
 
 
 def _snapshot_gpu_procs_cached():
@@ -195,6 +196,7 @@ def detect_process_changes(flat: list[dict]):
         p = current[pid]
         cvd = get_cuda_visible(pid)
         cvd_tag = f" (CUDA_VISIBLE_DEVICES={cvd})" if cvd is not None else ""
+        _pid_info[pid] = {**p, "cvd_tag": cvd_tag}
         add_event(
             "info",
             f"{p['user']} started: {p['cmd']}{cvd_tag}",
@@ -203,7 +205,16 @@ def detect_process_changes(flat: list[dict]):
         )
 
     for pid in _known_pids - current_pids:
-        add_event("info", f"PID {pid} finished (process exited)")
+        info = _pid_info.pop(pid, None)
+        if info:
+            add_event(
+                "info",
+                f"PID {pid} finished: {info['user']} | {info['cmd']}{info['cvd_tag']}",
+                gpu_id=info.get("gpu_id"),
+                processes=[info],
+            )
+        else:
+            add_event("info", f"PID {pid} finished (process exited)")
 
     _known_pids = current_pids
 
@@ -325,6 +336,8 @@ def main():
     print(f"[agent] starting, pushing to {DASHBOARD_URL} every {INTERVAL}s")
     threading.Thread(target=watch_dmesg, daemon=True).start()
 
+    last_sent_event_time = ""  # cursor: only send events newer than this
+
     while True:
         gpu_procs = get_gpu_processes()
         flat = []
@@ -343,7 +356,15 @@ def main():
         check_system_resources(cpu_pct, mem.percent)
 
         with event_lock:
-            recent_events = event_log[:50]
+            all_events = list(event_log)  # newest first
+
+        if last_sent_event_time:
+            new_events = [e for e in all_events if e["time"] > last_sent_event_time]
+        else:
+            new_events = all_events  # first push: send everything in memory
+
+        if all_events:
+            last_sent_event_time = all_events[0]["time"]
 
         payload = {
             "hostname": HOSTNAME,
@@ -353,7 +374,7 @@ def main():
             "mem_used_gb": round(mem.used / 1024**3, 1),
             "mem_total_gb": round(mem.total / 1024**3, 1),
             "gpus": gpu_stats,
-            "events": recent_events,
+            "events": new_events,
         }
         push(payload)
         time.sleep(INTERVAL)
