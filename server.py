@@ -485,7 +485,7 @@ async function selectHost(host) {
   _lastHist = hist;
   _applyLogData(logData);
   renderCharts(hist);
-  renderLogTable();
+  renderLogTable(logData.entries);
 }
 
 // ── Main content ──────────────────────────────────────
@@ -612,7 +612,7 @@ function _applyLogData(data) {
 async function refreshLogs() {
   const data = await fetchLogs(activeHost);
   _applyLogData(data);
-  renderLogTable();
+  renderLogTable(data.entries);
 }
 
 async function goLogPage(p) {
