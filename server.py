@@ -295,6 +295,7 @@ tr:last-child td{border:none}
     <span class="title" id="active-title">—</span>
     <span id="conn-status">Connecting...</span>
     <span id="update-rate" style="font-size:.72em;color:#d1d5db;margin-left:8px"></span>
+    <button id="refresh-btn" onclick="manualRefresh()" style="margin-left:12px;padding:4px 12px;font-size:.78em;border:1px solid #e5e7eb;border-radius:6px;background:#fff;color:#374151;cursor:pointer">↻ Refresh</button>
   </div>
   <div id="content">
     <div id="no-host">Select a server from the sidebar</div>
@@ -333,13 +334,19 @@ es.onmessage = async e => {
 es.onopen = () => setStatus('Live ●');
 es.onerror = () => setStatus('Reconnecting...');
 
-// polling fallback: refresh every 10s regardless of SSE
-setInterval(async () => {
-  await loadState();
-  if (activeHost) refreshContent();
-}, 10000);
-
 function setStatus(s) { document.getElementById('conn-status').textContent = s; }
+
+async function manualRefresh() {
+  const btn = document.getElementById('refresh-btn');
+  btn.textContent = '↻ ...';
+  await loadState();
+  if (activeHost) {
+    refreshContent();
+    _currentLogs = await fetchLogs(activeHost);
+    renderLogTable(_currentLogs);
+  }
+  btn.textContent = '↻ Refresh';
+}
 
 // ── Data ─────────────────────────────────────────────
 async function loadState() {
