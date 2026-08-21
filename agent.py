@@ -279,8 +279,7 @@ def push(payload):
         print(f"[WARN] push failed: {e}")
 
 
-CPU_WARN_PCT  = 60   # log warn when CPU stays above this
-CPU_ALERT_PCT = 90   # log error when CPU stays above this
+CPU_LOG_PCT   = 60   # log info when CPU stays above this
 MEM_WARN_PCT  = 80
 MEM_ALERT_PCT = 95
 
@@ -293,18 +292,20 @@ def check_system_resources(cpu_pct: float, mem_pct: float):
     now = time.time()
 
     # CPU
-    if cpu_pct >= CPU_WARN_PCT:
+    if cpu_pct >= CPU_LOG_PCT:
         if _cpu_high_since is None:
             _cpu_high_since = now
-        elif now - _cpu_high_since >= 15:   # sustained 15s before alerting
-            level = "error" if cpu_pct >= CPU_ALERT_PCT else "warn"
-            top = subprocess.check_output(
-                ["ps", "-eo", "pid,user,pcpu,comm", "--sort=-pcpu", "--no-headers"],
-                timeout=3
-            ).decode().splitlines()[:5]
-            top_str = " | ".join(l.strip() for l in top)
-            add_event(level, f"CPU high: {cpu_pct:.1f}% for {int(now-_cpu_high_since)}s | top: {top_str}")
-            _cpu_high_since = now   # reset to avoid repeated alerts every 5s
+        elif now - _cpu_high_since >= 15:
+            try:
+                top = subprocess.check_output(
+                    ["ps", "-eo", "pid,user,pcpu,comm", "--sort=-pcpu", "--no-headers"],
+                    timeout=3
+                ).decode().splitlines()[:5]
+                top_str = " | ".join(l.strip() for l in top)
+            except Exception:
+                top_str = "n/a"
+            add_event("info", f"CPU high: {cpu_pct:.1f}% for {int(now-_cpu_high_since)}s | top: {top_str}")
+            _cpu_high_since = now
     else:
         _cpu_high_since = None
 
@@ -313,7 +314,7 @@ def check_system_resources(cpu_pct: float, mem_pct: float):
         if _mem_high_since is None:
             _mem_high_since = now
         elif now - _mem_high_since >= 15:
-            level = "error" if mem_pct >= MEM_ALERT_PCT else "warn"
+            level = "warn" if mem_pct >= MEM_ALERT_PCT else "info"
             add_event(level, f"Memory high: {mem_pct:.1f}% sustained {int(now-_mem_high_since)}s")
             _mem_high_since = now
     else:
