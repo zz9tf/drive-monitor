@@ -6,7 +6,7 @@ import json
 import sys
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -16,8 +16,12 @@ import uvicorn
 app = FastAPI()
 
 MAX_HISTORY = 17280          # 24h at 5s intervals
+LOG_MAX_AGE = timedelta(days=7)
+LOG_MAX_PER_HOST = 20000     # hard cap per host
+
 state: dict[str, Any] = {}
 history: dict[str, deque] = {}   # hostname -> deque of slim datapoints
+logs: dict[str, list] = {}       # hostname -> list of log entries (newest last)
 state_lock = threading.Lock()
 subscribers: list[asyncio.Queue] = []
 subs_lock = threading.Lock()
@@ -35,6 +39,16 @@ def broadcast(msg: str):
             subscribers.remove(q)
 
 
+def _prune_logs(hostname: str):
+    """Remove log entries older than LOG_MAX_AGE; enforce hard cap."""
+    cutoff = datetime.now() - LOG_MAX_AGE
+    entries = logs.get(hostname, [])
+    entries = [e for e in entries if datetime.fromisoformat(e["t"]) >= cutoff]
+    if len(entries) > LOG_MAX_PER_HOST:
+        entries = entries[-LOG_MAX_PER_HOST:]
+    logs[hostname] = entries
+
+
 @app.post("/update")
 async def update(request: Request):
     data = await request.json()
@@ -42,6 +56,23 @@ async def update(request: Request):
     data["_received"] = datetime.now().isoformat()
     with state_lock:
         state[hostname] = data
+        # copy agent events into the log store
+        for ev in data.get("events", []):
+            entry = {
+                "t": ev.get("time", datetime.now().isoformat(timespec="seconds")),
+                "level": ev.get("level", "info").lower(),
+                "msg": str(ev.get("msg", "")),
+                "gpu_id": ev.get("gpu_id"),
+                "hostname": hostname,
+            }
+            if hostname not in logs:
+                logs[hostname] = []
+            # avoid duplicates: skip if same t+msg already stored
+            if not any(e["t"] == entry["t"] and e["msg"] == entry["msg"]
+                       for e in logs[hostname][-20:]):
+                logs[hostname].append(entry)
+        if hostname in logs:
+            _prune_logs(hostname)
         if hostname not in history:
             history[hostname] = deque(maxlen=MAX_HISTORY)
         history[hostname].append({
@@ -60,22 +91,70 @@ async def update(request: Request):
     return {"ok": True}
 
 
+@app.post("/log")
+async def receive_log(request: Request):
+    """Accept a log entry from any device.
+
+    Expected JSON fields:
+      hostname  str   (required)
+      level     str   info | warn | error  (default: info)
+      msg       str   (required)
+      time      str   ISO-8601  (optional, server fills if missing)
+      gpu_id    int   (optional)
+    """
+    data = await request.json()
+    hostname = data.get("hostname", "unknown")
+    entry = {
+        "t": data.get("time") or datetime.now().isoformat(timespec="seconds"),
+        "level": data.get("level", "info").lower(),
+        "msg": str(data.get("msg", "")),
+        "gpu_id": data.get("gpu_id"),
+        "hostname": hostname,
+    }
+    with state_lock:
+        if hostname not in logs:
+            logs[hostname] = []
+        logs[hostname].append(entry)
+        _prune_logs(hostname)
+    broadcast(json.dumps({"host": hostname, "log": True}))
+    return {"ok": True}
+
+
 @app.get("/api/state")
 async def api_state():
     with state_lock:
         return dict(state)
 
 
+@app.delete("/api/server/{hostname}")
+async def delete_server(hostname: str):
+    with state_lock:
+        state.pop(hostname, None)
+        history.pop(hostname, None)
+        logs.pop(hostname, None)
+    return {"ok": True}
+
+
 @app.get("/api/history/{hostname}")
 async def api_history(hostname: str, points: int = 500):
     with state_lock:
         buf = list(history.get(hostname, []))
-    # downsample
     n = len(buf)
-    if n > points:
+    if n > points and points > 0:
         step = n / points
         buf = [buf[int(i * step)] for i in range(points)]
     return buf
+
+
+@app.get("/api/logs/{hostname}")
+async def api_logs(hostname: str, limit: int = 500):
+    with state_lock:
+        _prune_logs(hostname)
+        entries = list(logs.get(hostname, []))
+    # return newest-first for the UI
+    entries = entries[-limit:][::-1]
+    return entries
+
 
 
 @app.get("/events")
@@ -109,7 +188,6 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>GPU Monitor</title>
 <script>
-// Load Chart.js async — page works even if CDN is unreachable
 (function(){
   const s = document.createElement('script');
   s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js';
@@ -149,7 +227,7 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f0f2f5;color:#1f
 .stat-card .value{font-size:1.6em;font-weight:700;color:#111;line-height:1}
 .stat-card .sub{font-size:.75em;color:#9ca3af;margin-top:4px}
 
-/* nvitop-style GPU panel — white theme */
+/* nvitop-style GPU panel */
 .nv-panel{background:transparent;font-family:ui-monospace,'Cascadia Code','JetBrains Mono',monospace}
 .nv-grid{display:flex;flex-direction:column;gap:8px}
 .nv-card{border:1px solid #e2e8f0;border-radius:10px;padding:11px 16px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.06)}
@@ -161,17 +239,14 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f0f2f5;color:#1f
 .nv-tag{font-size:.68em;padding:1px 6px;border-radius:4px;font-weight:700;letter-spacing:.04em;margin-top:4px;display:inline-block}
 .nv-tag-ok{background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0}
 .nv-tag-dead{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
-/* bars column */
 .nv-bars{display:flex;flex-direction:column;gap:5px}
 .nv-row{display:flex;align-items:center;gap:8px}
 .nv-rowlabel{width:32px;color:#94a3b8;flex-shrink:0;font-size:.72em;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
 .nv-bar-bg{flex:1;height:8px;background:#f1f5f9;border-radius:99px;overflow:hidden}
 .nv-bar{height:100%;border-radius:99px;transition:width .5s ease}
 .nv-val{width:100px;text-align:right;color:#374151;flex-shrink:0;font-size:.78em}
-/* meta */
 .nv-meta{display:flex;gap:14px;margin-top:5px;font-size:.72em;color:#94a3b8}
 .nv-meta b{color:#374151}
-/* process table */
 .nv-procs{font-size:.75em}
 .nv-proc-hdr{display:grid;grid-template-columns:54px 72px 60px 1fr;gap:6px;color:#cbd5e1;font-weight:600;text-transform:uppercase;letter-spacing:.05em;font-size:.85em;margin-bottom:3px}
 .nv-proc-row{display:grid;grid-template-columns:54px 72px 60px 1fr;gap:6px;padding:1px 0;color:#64748b}
@@ -182,23 +257,28 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f0f2f5;color:#1f
 .nv-proc-cmd{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#2563eb}
 .nv-no-proc{color:#d1d5db;font-size:.85em}
 .nv-dead-msg{color:#ef4444;font-size:.84em}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.7em;font-weight:600}
-.badge-ok{background:#dcfce7;color:#15803d}
-.badge-dead{background:#fee2e2;color:#dc2626}
 
 /* Charts panel */
 .chart-panel{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .chart-panel h3{font-size:.8em;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px}
 .chart-wrap{position:relative;height:180px}
 
-/* Event log */
-.event-panel{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.event-panel h3{font-size:.8em;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+/* Log panel */
+.log-panel{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.log-panel-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.log-panel-hdr h3{font-size:.8em;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.06em}
+.log-panel-hdr .log-count{font-size:.72em;color:#9ca3af}
+.log-filter{margin-left:auto;display:flex;gap:4px}
+.log-filter button{font-size:.72em;padding:2px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;color:#6b7280;cursor:pointer}
+.log-filter button.active{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;font-weight:600}
+.log-table-wrap{max-height:320px;overflow-y:auto}
 table{width:100%;border-collapse:collapse;font-size:.78em}
-th{color:#9ca3af;font-weight:600;padding:5px 8px;text-align:left;border-bottom:1px solid #f3f4f6}
-td{padding:5px 8px;border-bottom:1px solid #f9fafb;color:#374151}
+th{color:#9ca3af;font-weight:600;padding:5px 8px;text-align:left;border-bottom:1px solid #f3f4f6;position:sticky;top:0;background:#fff;z-index:1}
+td{padding:5px 8px;border-bottom:1px solid #f9fafb;color:#374151;vertical-align:top}
 tr:last-child td{border:none}
 .lv-info{color:#2563eb}.lv-warn{color:#d97706}.lv-error{color:#dc2626}
+.log-msg{word-break:break-word;max-width:500px}
+
 
 #no-host{display:flex;align-items:center;justify-content:center;flex:1;color:#9ca3af;font-size:.9em}
 </style>
@@ -224,10 +304,12 @@ tr:last-child td{border:none}
 <script>
 let activeHost = null;
 let allState = {};
-let gpuDonuts = {};
 let cpuMemChart = null;
 let gpuLineChart = null;
 let _lastUpdateTime = null;
+let _lastHist = null;
+let _logFilter = 'all';   // 'all' | 'info' | 'warn' | 'error'
+let _currentLogs = [];
 
 // ── SSE ──────────────────────────────────────────────
 const es = new EventSource('/events');
@@ -240,7 +322,13 @@ es.onmessage = async e => {
   }
   _lastUpdateTime = now;
   await loadState();
-  if (activeHost === msg.host) refreshContent();
+  if (activeHost === msg.host) {
+    if (msg.log) {
+      await refreshLogs();
+    } else {
+      refreshContent();
+    }
+  }
 };
 es.onopen = () => setStatus('Live ●');
 es.onerror = () => { setStatus('Reconnecting...'); setTimeout(loadState, 3000); };
@@ -259,42 +347,52 @@ async function loadHistory(host) {
   return r.json();
 }
 
+async function fetchLogs(host) {
+  const r = await fetch(`/api/logs/${encodeURIComponent(host)}?limit=500`);
+  return r.json();
+}
+
 // ── Sidebar ───────────────────────────────────────────
 function renderSidebar() {
   const hosts = Object.keys(allState);
   const el = document.getElementById('host-list');
-  if (!hosts.length) { el.innerHTML = '<p style="font-size:.8em;color:#9ca3af;padding:12px">Waiting for agents...</p>'; return; }
 
-  el.innerHTML = hosts.map(h => {
-    const d = allState[h];
-    const stale = d._received && (Date.now() - new Date(d._received)) > 30000;
-    const gpuCount = (d.gpus||[]).length;
-    const deadCount = (d.gpus||[]).filter(g => g.status !== 'ok').length;
-    const dotCls = stale ? 'dot-red' : deadCount ? 'dot-red' : 'dot-green';
-    const sub = stale ? 'offline' : `${gpuCount} GPU${gpuCount!==1?'s':''}`+(deadCount?` · ${deadCount} dead`:'');
-    return `<div class="host-item${activeHost===h?' active':''}" onclick="selectHost('${h}')">
-      <div class="host-name"><span class="dot ${dotCls}"></span>${h}</div>
-      <div class="host-sub">${sub}</div>
-    </div>`;
-  }).join('');
+  let html = '';
+  if (!hosts.length) {
+    html += '<p style="font-size:.8em;color:#9ca3af;padding:12px">Waiting for agents...</p>';
+  } else {
+    html += hosts.map(h => {
+      const d = allState[h];
+      const stale = d._received && (Date.now() - new Date(d._received)) > 30000;
+      const gpuCount = (d.gpus||[]).length;
+      const deadCount = (d.gpus||[]).filter(g => g.status !== 'ok').length;
+      const dotCls = stale ? 'dot-red' : deadCount ? 'dot-red' : 'dot-green';
+      const sub = stale ? 'offline' : `${gpuCount} GPU${gpuCount!==1?'s':''}`+(deadCount?` · ${deadCount} dead`:'');
+      return `<div class="host-item${activeHost===h?' active':''}" onclick="selectHost('${h}')">
+        <div class="host-name"><span class="dot ${dotCls}"></span>${h}</div>
+        <div class="host-sub">${sub}</div>
+      </div>`;
+    }).join('');
+  }
+  el.innerHTML = html;
 }
 
 async function selectHost(host) {
   activeHost = host;
   document.getElementById('active-title').textContent = host;
   renderSidebar();
-  gpuDonuts = {};
-  cpuMemChart = null;
-  gpuLineChart = null;
+  cpuMemChart = null; gpuLineChart = null;
   document.getElementById('no-host') && (document.getElementById('no-host').style.display = 'none');
   refreshContent();
-  const hist = await loadHistory(host);
+  const [hist, logs] = await Promise.all([loadHistory(host), fetchLogs(host)]);
+  _lastHist = hist;
+  _currentLogs = logs;
   renderCharts(hist);
+  renderLogTable(_currentLogs);
 }
 
 // ── Main content ──────────────────────────────────────
 function refreshContent() {
-  if (!activeHost) return;
   const d = allState[activeHost];
   if (!d) return;
   const stale = d._received && (Date.now() - new Date(d._received)) > 30000;
@@ -325,7 +423,7 @@ function refreshContent() {
     </div>
   </div>`;
 
-  // nvitop-style GPU panel
+  // GPU panel
   html += `<div class="nv-panel"><div class="nv-grid">`;
   for (const g of (d.gpus || [])) {
     const dead = g.status !== 'ok';
@@ -336,18 +434,14 @@ function refreshContent() {
     const ecc = g.ecc_errors || 0;
 
     html += `<div class="nv-card${dead?' nv-dead':''}"><div class="nv-card-inner">`;
-
-    // col 1: ID + tag
     html += `<div>
       <div class="nv-id">GPU ${g.id}</div>
       <div class="nv-name">H100 PCIe</div>
       <span class="nv-tag ${dead?'nv-tag-dead':'nv-tag-ok'}">${dead?'DEAD':'OK'}</span>
     </div>`;
-
     if (dead) {
       html += `<div class="nv-dead-msg">${g.error || 'Device error'}</div>`;
     } else {
-      // col 2: bars + meta
       html += `<div class="nv-bars">
         <div class="nv-row">
           <span class="nv-rowlabel">GPU</span>
@@ -364,8 +458,6 @@ function refreshContent() {
           <span>ECC <b ${ecc?'style="color:#ef4444"':''}>${ecc}</b></span>
         </div>
       </div>`;
-
-      // col 3: process table
       if (g.processes?.length) {
         html += `<div class="nv-procs">
           <div class="nv-proc-hdr"><span>PID</span><span>USER</span><span>VRAM</span><span>COMMAND</span></div>`;
@@ -381,7 +473,6 @@ function refreshContent() {
         html += `<div class="nv-procs"><div class="nv-no-proc">─ no processes ─</div></div>`;
       }
     }
-
     html += `</div></div>`;
   }
   html += `</div></div>`;
@@ -396,37 +487,93 @@ function refreshContent() {
     <div class="chart-wrap"><canvas id="chart-gpu"></canvas></div>
   </div>`;
 
-  // events
-  const events = d.events || [];
-  html += `<div class="event-panel"><h3>Event Log</h3>`;
-  if (events.length) {
-    html += `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>Message</th></tr>`;
-    for (const e of events)
-      html += `<tr><td>${e.time}</td><td class="lv-${e.level}">${e.level.toUpperCase()}</td><td>${e.gpu_id??'-'}</td><td>${e.msg}</td></tr>`;
-    html += `</table>`;
-  } else {
-    html += `<p style="font-size:.82em;color:#9ca3af;padding:8px 0">No events yet.</p>`;
-  }
-  html += `</div>`;
+  // log panel placeholder (data filled by renderLogTable)
+  html += `<div class="log-panel" id="log-panel">
+    <div class="log-panel-hdr">
+      <h3>Device Logs</h3>
+      <span class="log-count" id="log-count"></span>
+      <div class="log-filter" id="log-filter-btns">${logFilterButtons()}</div>
+    </div>
+    <div class="log-table-wrap" id="log-table-wrap">
+      <p style="font-size:.82em;color:#9ca3af;padding:8px 0">Loading logs…</p>
+    </div>
+  </div>`;
 
   document.getElementById('content').innerHTML = html;
 
-  // restore line charts if history was already loaded
   if (_lastHist) renderCharts(_lastHist);
+  if (_currentLogs.length) renderLogTable(_currentLogs);
+  attachFilterButtons();
 }
 
-let _lastHist = null;
+async function refreshLogs() {
+  _currentLogs = await fetchLogs(activeHost);
+  renderLogTable(_currentLogs);
+}
 
+// ── Log rendering ─────────────────────────────────────
+function filterLogs(logs) {
+  if (_logFilter === 'all') return logs;
+  return logs.filter(e => e.level === _logFilter);
+}
+
+function logFilterButtons() {
+  return ['all','info','warn','error'].map(f =>
+    `<button class="log-filter-btn${_logFilter===f?' active':''}" data-f="${f}">${f}</button>`
+  ).join('');
+}
+
+function attachFilterButtons() {
+  document.querySelectorAll('.log-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _logFilter = btn.dataset.f;
+      renderLogTable(_currentLogs);
+    });
+  });
+}
+
+function renderLogTable(logs) {
+  const wrap = document.getElementById('log-table-wrap');
+  const countEl = document.getElementById('log-count');
+  if (!wrap) return;
+  const filtered = filterLogs(logs);
+  if (countEl) countEl.textContent = `${logs.length} entries (7 days)`;
+  // update filter buttons active state
+  document.querySelectorAll('.log-filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.f === _logFilter);
+  });
+  if (!filtered.length) {
+    wrap.innerHTML = `<p style="font-size:.82em;color:#9ca3af;padding:8px 0">${
+      logs.length ? 'No entries match the filter.' : 'No logs yet. POST to <code>/log</code> from any device.'
+    }</p>`;
+    return;
+  }
+  let html = `<table><tr><th>Time</th><th>Level</th><th>GPU</th><th>Message</th></tr>`;
+  for (const e of filtered)
+    html += `<tr>
+      <td style="white-space:nowrap">${e.t.replace('T',' ').slice(0,19)}</td>
+      <td class="lv-${e.level}">${e.level.toUpperCase()}</td>
+      <td>${e.gpu_id != null ? e.gpu_id : '—'}</td>
+      <td class="log-msg">${escHtml(e.msg)}</td>
+    </tr>`;
+  html += `</table>`;
+  wrap.innerHTML = html;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Charts ────────────────────────────────────────────
 function renderCharts(hist) {
   _lastHist = hist;
   if (!hist.length) return;
   if (!window._chartReady) { window._pendingCharts = () => renderCharts(hist); return; }
 
-  const labels = hist.map(p => p.t.slice(11, 16));  // HH:MM
+  const labels = hist.map(p => p.t.slice(11, 16));
   const cpuData = hist.map(p => p.cpu);
   const memData = hist.map(p => p.mem);
 
-  // CPU + Memory line chart
   const cpuCtx = document.getElementById('chart-cpumem');
   if (cpuCtx) {
     if (cpuMemChart) cpuMemChart.destroy();
@@ -443,7 +590,6 @@ function renderCharts(hist) {
     });
   }
 
-  // GPU utilization line chart
   const gpuCtx = document.getElementById('chart-gpu');
   if (!gpuCtx || !hist[0]?.gpus?.length) return;
   const colors = ['#6366f1','#22c55e','#f59e0b','#ef4444','#06b6d4','#ec4899'];
